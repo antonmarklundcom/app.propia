@@ -1,0 +1,32 @@
+{
+  "expo": {
+    "name": "propia",
+    "slug": "propia-app",
+    "scheme": "propia",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "automatic",
+    "icon": "./assets/icon.png",
+    "splash": {
+      "backgroundColor": "#0B1B2B"
+    },
+    "assetBundlePatterns": ["**/*"],
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.propia.app",
+      "associatedDomains": ["applinks:propia.com.py"]
+    },
+    "android": {
+      "package": "com.propia.app",
+      "intentFilters": [
+        {
+          "action": "VIEW",
+          "autoVerify": true,
+          "data": [{ "scheme": "https", "host": "propia.com.py", "pathPrefix": "/propiedad" }],
+          "category": ["BROWSABLE", "DEFAULT"]
+        }
+      ]
+    },
+    "plugins": ["expo-router"]
+  }
+}
