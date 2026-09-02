@@ -44,6 +44,13 @@ feature phase; medium = will bite when real data lands; low = polish.
 | F16 | low | security (dev only) | `npm audit`: 32 advisories, 1 critical (`tar` via `@expo/cli`), all in the SDK 52 dev toolchain | Nothing in shipped app code is affected. | Noise, but it disappears with F4. | Resolved by the SDK upgrade; re-run audit after. |
 | F17 | low | docs | `README.md`, `ARCHITECTURE.md` §1 (dated 2026-07-12), `API_CONTRACT.md` | State facts that are now false: "propia.com.py är inte lanserad", "aktiv produktionsincident" (resolved per propia.node PLAN.md), propia branding, mock-only dev loop. | Next session orients from these and rebuilds on a false premise (this review nearly did). | Rewrite after the rebrand decision; make `fable/plan.md` §9 the state of the world until then. |
 | F18 | low | mock | `src/api/mockData.ts:10-11` | Mock images hotlink `picsum.photos`. | Fine for mock; must never be in a store build. | Guard: `EXPO_PUBLIC_USE_MOCK` cannot be true in a `production` EAS profile. |
+| F19 | info | hosting/process-cap | this repo: `git ls-files` (16 files), `package.json:7-13` | **This repo runs no server.** No `next`, no `next-server`, no DB pool, no `.htaccess`/ecosystem/Procfile/server file, nothing deployed to Hostinger. The 2–3 `next-server` processes seen over SSH belong to **propia.node**. | The investigation's premise points at the wrong repo; nothing here can raise or lower the instance count. | Read §6 below, which runs the same investigation on propia.node. |
+| F20 | medium | hosting/process-cap | propia.node: `git ls-files`, `package.json` scripts, `next.config.ts` | No repo-side instance/worker configuration exists in propia.node either: no `.htaccess`, `ecosystem.*`, `Procfile`, `server.js`, `instrumentation.ts`, `engines`, or `NODE_OPTIONS`; `start` is plain `next start`. Instance count is therefore entirely the hosting panel's LiteSpeed Node-app setting. | Same result as the sibling-repo audits: the knob is in hPanel, not git. | Anton checks the Node.js app's settings in hPanel (instances / max connections per instance) and pins it to 1 while there are zero users (§6.4). |
+| F21 | ok | hosting/process-cap | propia.node `src/db/index.ts:30-42` | Pool is the bounded-queue pattern: `connectionLimit 6`, `maxIdle 6`, `idleTimeout 30 s`, `waitForConnections true`, `queueLimit 24`, `connectTimeout 8000`. | Matches the fix shipped elsewhere on the account. Note the multiplier: each `next-server` instance owns its own pool, so 3 instances = up to 18 MySQL connections and 72 queued requests. | Nothing to change in code. One more reason to run one instance. |
+| F22 | high | hosting/process-cap | propia.node `src/lib/crm.ts:102`, `app/api/leads/route.ts:187` | `POST /api/leads` **awaits** `pushLead()`, which is a bare `fetch(webhookUrl)` with no timeout/AbortSignal, whenever `LEAD_WEBHOOK_URL` or `GHL_WEBHOOK_URL` is set (`crm.ts:160`). Node's fetch waits up to 300 s for headers by default. A slow or hanging GHL endpoint holds the handler, and therefore the process, open. | This is the exact "request that never resolves keeps its process alive" mechanism from the 2026-07-26 post-mortem, reintroduced through a different dependency. The operator alert on line 173 is already correctly deferred with `after()`; the lead push is not. | In `crm.ts` `post()`: `signal: AbortSignal.timeout(8_000)`. Better: move `pushLead` + the `ghlContactId` update into the same `after()` block, since the lead row is already stored and the response does not need the contact id. Ported into plan O3 (§5.3.6). |
+| F23 | medium | hosting/process-cap | propia.node: 39 routes `export const dynamic = "force-dynamic"`; `app/page.tsx:66-68`; `app/propiedad/[slug]/page.tsx:51,137,222` | Every public page renders per request (host header is a dynamic API), with 9 DB queries per category/detail view per the post-mortem. Only directory lists, medians, financing and sitemap entries sit behind `unstable_cache`. `next/image` is unused (0 imports), so no in-process `sharp` on the request path (`sharp` is only in `src/lib/images.ts`, the upload path). | Slow-ish, DB-bound requests raise concurrency; concurrency above one instance's connection limit is what makes LiteSpeed start a second and third instance. With zero users that concurrency comes from crawlers hitting up to 25 000 sitemap URLs (`src/lib/sitemap-xml.ts:44-46`). | Not this plan's scope beyond the API: O3 must serve `/api/v1/*` with cache headers LiteSpeed honours (`Cache-Control` **and** `X-LiteSpeed-Cache-Control`) and prove a cache hit after deploy (§5.3.2). Whole-site caching is a propia.node backlog item. |
+| F24 | low | hosting/process-cap | propia.node `app/api/health/route.ts`, `app/api/health/db/route.ts:40-60`, `src/lib/rate-limit.ts:22-28`, `src/lib/auth/rate-limit.ts:54-63` | Health probes are sound: `/api/health` touches nothing; `/api/health/db` is `SELECT 1` bounded by the pool's 8 s timeout and answers 503 on failure. No module-level timers; the two in-memory maps are swept each window, so no unbounded memory growth was found. Nothing in the repo registers either route as a LiteSpeed/uptime health check. | If an external monitor polls `/api/health/db` and the pool is saturated, it will see 503s, which some panels treat as "restart the app". That would explain restarts, not extra instances. | Point any uptime monitor at `/api/health`, not `/api/health/db`; keep the db probe for humans. |
+| F25 | low | hosting/process-cap | propia.node `next.config.ts` (`output: "standalone"`) vs `package.json` `start: next start` | The build emits a standalone server, but the start script runs `next start`. Whichever one Hostinger executes, the other is dead weight; if it runs `npm start`, the standalone output is built and never used. | Confusing during incident triage ("which server is this?"), and doubles build output on a plan at 96 % of resources. | Pick one: drop `output: "standalone"`, or set `start` to `node .next/standalone/server.js` and confirm hPanel's start command matches. |
 
 Checked and found clean: WhatsApp deep link construction (`wa.me` + digits-only number, encoded text), no secrets in repo, `.gitignore` covers `.env*`, TS `strict` on, `@/` alias resolves, `Link asChild` card navigation works, es-PY formatting mirrors the web.
 
@@ -63,6 +70,73 @@ Checked and found clean: WhatsApp deep link construction (`wa.me` + digits-only 
 3. **Expo SDK target.** Recommended: the current stable at phase start (57 today). Not 53 or 54 — one upgrade, not two.
 4. **Rentals in guaraníes.** Recommended: yes, add `priceAmount`/`priceCurrency` to contract v1 (F7). Costs nothing now, a v2 later.
 5. **Spanish only for v1?** Recommended: yes. The API may carry `titleEn/descriptionEn` optionally; the app ignores them until an EN door exists.
+
+## 6. Hostinger process-cap investigation
+
+Requested as "specific to this repo". **The premise does not hold for app.propia**: it is an
+Expo client, has no server process, no deploy artefact and no database connection (F19).
+The `next-server` processes are propia.node's, so the investigation was run on propia.node
+at `be89c85` (read-only clone). hPanel, SSH, LiteSpeed config and access logs were not
+reachable from this session; everything below is from the two repositories.
+
+### 6.1 Deploy config that sets instance/worker count
+
+None, in either repo. Searched tracked files for `.htaccess`, `ecosystem.*`, `Procfile`,
+`server.*`, Dockerfile, `instrumentation.*`, `lsnode`/LiteSpeed/Hostinger manifests,
+`.nvmrc`/`.node-version`, `engines`, `NODE_OPTIONS`. propia.node has only `next.config.ts`
+(images, `output: "standalone"`, headers) and `.npmrc` (pnpm build allowlist). Its start
+script is `next start`. Conclusion: instance count is set in the hosting panel's Node.js app
+configuration, exactly as the sibling-repo audits found (F20).
+
+### 6.2 What could make LiteSpeed spawn extra instances instead of reusing one
+
+LiteSpeed starts another Node instance when concurrent requests exceed what the running
+instance is allowed to hold, and reaps idle ones later. So the question is "what makes
+requests slow or concurrent": 
+
+- **Untimed outbound call in the request path (F22, high).** `/api/leads` awaits the CRM
+  webhook with no timeout. One slow GHL response = one handler held open for up to 300 s =
+  one process that cannot serve. This is the post-mortem's mechanism through a new door.
+- **Per-request SSR everywhere (F23, medium).** 39 `force-dynamic` routes plus the home and
+  detail pages, which are dynamic because the host header is read. About 9 queries per view.
+  Crawlers walking the sitemap (up to 25 000 URLs per chunk set) are the realistic source of
+  concurrency on a site with zero users.
+- **Keep-alive:** nothing configured in the repo (no `--keepAliveTimeout`, no custom server).
+  Defaults apply; not a cause I could confirm.
+- **Health checks (F24, low):** both probes are correct and cheap; neither is registered as a
+  LiteSpeed health check in the repo. If an external monitor polls `/api/health/db` during
+  pool saturation it gets 503s, which explains restarts, not spawns.
+- **Memory growth:** no module-level timers, and both in-memory maps (`rate-limit.ts`,
+  `auth/rate-limit.ts`) are swept each window. `next/image` is unused, so `sharp` never runs
+  in the request path. No growth source found.
+- **Thread count:** ~11 threads per `next-server` is Node's baseline (main thread, 4 libuv
+  workers, V8 platform workers, inspector). Not tunable from the repo in any useful way.
+
+### 6.3 DB pool
+
+`src/db/index.ts:30-42` is the bounded pattern: `connectionLimit 6`, `queueLimit 24`,
+`connectTimeout 8000`, `waitForConnections true`, `maxIdle 6`, `idleTimeout 30 s` (F21).
+Because every instance owns a pool, three instances mean up to 18 connections and 72 queued
+requests against Hostinger's per-user MySQL limit. Correct code, wrong multiplier.
+
+### 6.4 Does traffic justify multiple instances?
+
+No, on the evidence available. propia.node CLAUDE.md line 414 states "Zero live users". No
+analytics integration exists in the code (no gtag, Plausible, Umami, PostHog), and no logs
+were reachable from here. What remains is crawler and monitor traffic. Two or three standing
+`next-server` instances for that is waste against a shared 200-process cap, and each carries
+its own MySQL pool.
+
+Recommended actions, in order (all outside this repo; only the O3 items are in this plan):
+1. In hPanel, set the propia.node Node.js app to **1 instance** and record the setting in
+   propia.node PLAN.md. Revisit only when an access log shows real concurrency.
+2. Ship F22 (timeout, or move the CRM push into `after()`): plan O3 §5.3.6.
+3. Pull one day of the LiteSpeed access log; if `/propiedad/*` crawler bursts dominate, the
+   durable fix is response caching for public pages (propia.node backlog), and the mobile API
+   must not add to it: O3 serves `/api/v1/*` with `Cache-Control` and
+   `X-LiteSpeed-Cache-Control` and verifies an `X-LiteSpeed-Cache: hit` after deploy.
+4. Point any uptime monitor at `/api/health`, not `/api/health/db`.
+5. Resolve F25 so the running server is unambiguous during the next incident.
 
 ## 5. Fixed in this session
 

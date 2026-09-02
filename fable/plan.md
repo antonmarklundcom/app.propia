@@ -195,8 +195,10 @@ schema) — if implementing the contract seems to require any of those, stop and
    `currentVertical()`, `parseFacetParams`, `NextResponse.json`). Reuse
    `src/lib/queries.ts`; add a query function only if none fits, in that file, following its
    style. Apply `allowRequest` from `src/lib/rate-limit.ts`. Set the `Cache-Control` header
-   from the contract. Never return `addressText`, `reviewNotes`, `ownerUserId`,
-   `foreignExposure`, or any non-published row.
+   from the contract **and** `X-LiteSpeed-Cache-Control: public, max-age=300` so Hostinger's
+   LiteSpeed serves repeat hits without touching Node (REVIEW §6). `/meta` gets 3600 s. Never
+   return `addressText`, `reviewNotes`, `ownerUserId`, `foreignExposure`, or any non-published
+   row. Every DB call in these routes goes through the shared pool; no new pools, no timers.
 3. Add `scripts/verify-api-v1.ts` (tsx) that hits the three routes against a running local
    `next start` and asserts shape + `published`-only + 404 on a draft + rate-limit 429; wire
    it into `verify:local` only if the existing verify scripts are structured that way,
@@ -207,12 +209,20 @@ schema) — if implementing the contract seems to require any of those, stop and
    filled in before universal links verify (human input H4).
 5. PLAN.md entry per its conventions; run `npm run verify:local`; PR on `claude/app-api-v1`,
    merge when green. Hostinger auto-deploys `main`: after merge, curl the live routes on
-   `realestateinparaguay.com` and confirm JSON + headers; record the live base URL in
-   app.propia §9 (this file) via a tiny follow-up commit on app.propia `main`.
+   `realestateinparaguay.com` and confirm JSON + headers, and that a second request within
+   300 s returns `X-LiteSpeed-Cache: hit` (if it does not, record that in PLAN.md as a `[YOU]`
+   item: enable LSCache for the app in hPanel); record the live base URL in app.propia §9
+   (this file) via a tiny follow-up commit on app.propia `main`.
+6. Process-cap hardening ported from REVIEW F22, same PR, same "no request may hang" rule the
+   API obeys: in `src/lib/crm.ts` `post()`, add `signal: AbortSignal.timeout(8_000)`; in
+   `app/api/leads/route.ts`, move `pushLead` and the `ghlContactId` update into the existing
+   `after()` block and respond `{ ok: true, leadId }` immediately. Keep the lead stored
+   before anything else, exactly as today. No other propia.node behaviour changes.
 
-Exit: three routes live and returning contract-shaped JSON with `Cache-Control`; verify
-script passes; a draft listing returns 404; `npm run verify:local` green; propia.node
-PLAN.md and app.propia §9 both updated.
+Exit: three routes live and returning contract-shaped JSON with both cache headers; verify
+script passes; a draft listing returns 404; `npm run verify:local` green; `/api/leads`
+returns within the DB round-trip with a stalled webhook URL (test with a local sink that
+never responds); propia.node PLAN.md and app.propia §9 both updated.
 
 ## §6 Sonnet phases
 
@@ -280,6 +290,9 @@ closing report (§4.9 STOP footer in the prompt) posted.
 
 - 2026-09-02 — Fable review session. `9320775` adds `expo-asset` (REVIEW F3). This plan
   and `fable/REVIEW.md` written. Next phase: O1. Nothing else changed.
+- 2026-09-02 — Process-cap investigation added (REVIEW §6, F19–F25). Outcome for this plan:
+  O3 gains LiteSpeed cache headers + hit check (§5.3.2, §5.3.5) and the `/api/leads` webhook
+  timeout/`after()` port (§5.3.6). hPanel instance count is a human action, not a phase.
 
 ## §10 Backlog
 
