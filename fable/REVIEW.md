@@ -47,7 +47,9 @@ feature phase; medium = will bite when real data lands; low = polish.
 | F19 | info | hosting/process-cap | this repo: `git ls-files` (16 files), `package.json:7-13` | **This repo runs no server.** No `next`, no `next-server`, no DB pool, no `.htaccess`/ecosystem/Procfile/server file, nothing deployed to Hostinger. The 2–3 `next-server` processes seen over SSH belong to **propia.node**. | The investigation's premise points at the wrong repo; nothing here can raise or lower the instance count. | Read §6 below, which runs the same investigation on propia.node. |
 | F20 | medium | hosting/process-cap | propia.node: `git ls-files`, `package.json` scripts, `next.config.ts` | No repo-side instance/worker configuration exists in propia.node either: no `.htaccess`, `ecosystem.*`, `Procfile`, `server.js`, `instrumentation.ts`, `engines`, or `NODE_OPTIONS`; `start` is plain `next start`. Instance count is therefore entirely the hosting panel's LiteSpeed Node-app setting. | Same result as the sibling-repo audits: the knob is in hPanel, not git. | Anton checks the Node.js app's settings in hPanel (instances / max connections per instance) and pins it to 1 while there are zero users (§6.4). |
 | F21 | ok | hosting/process-cap | propia.node `src/db/index.ts:30-42` | Pool is the bounded-queue pattern: `connectionLimit 6`, `maxIdle 6`, `idleTimeout 30 s`, `waitForConnections true`, `queueLimit 24`, `connectTimeout 8000`. | Matches the fix shipped elsewhere on the account. Note the multiplier: each `next-server` instance owns its own pool, so 3 instances = up to 18 MySQL connections and 72 queued requests. | Nothing to change in code. One more reason to run one instance. |
-| F22 | high | hosting/process-cap | propia.node `src/lib/crm.ts:102`, `app/api/leads/route.ts:187` | `POST /api/leads` **awaits** `pushLead()`, which is a bare `fetch(webhookUrl)` with no timeout/AbortSignal, whenever `LEAD_WEBHOOK_URL` or `GHL_WEBHOOK_URL` is set (`crm.ts:160`). Node's fetch waits up to 300 s for headers by default. A slow or hanging GHL endpoint holds the handler, and therefore the process, open. | This is the exact "request that never resolves keeps its process alive" mechanism from the 2026-07-26 post-mortem, reintroduced through a different dependency. The operator alert on line 173 is already correctly deferred with `after()`; the lead push is not. | In `crm.ts` `post()`: `signal: AbortSignal.timeout(8_000)`. Better: move `pushLead` + the `ghlContactId` update into the same `after()` block, since the lead row is already stored and the response does not need the contact id. Ported into plan O3 (§5.3.6). |
+| F22 | high | hosting/process-cap | propia.node `src/lib/crm.ts:102`, `app/api/leads/route.ts:187` | `POST /api/leads` **awaits** `pushLead()`, which is a bare `fetch(webhookUrl)` with no timeout/AbortSignal, whenever `LEAD_WEBHOOK_URL` or `GHL_WEBHOOK_URL` is set (`crm.ts:160`). Node's fetch waits up to 300 s for headers by default. A slow or hanging GHL endpoint holds the handler, and therefore the process, open. | This is the exact "request that never resolves keeps its process alive" mechanism from the 2026-07-26 post-mortem, reintroduced through a different dependency. The operator alert on line 173 is already correctly deferred with `after()`; the lead push is not. | **Fixed 2026-09-02** on propia.node branch `claude/leads-webhook-timeout`: `AbortSignal.timeout(12_000)` on the fetch in `post()`, timeout classified in the error string. Proven with a never-responding sink (12.0 s, `ok:false`). Merge it; O3 §5.3.6 then only needs the `after()` move, which is optional. |
+| F26 | medium | hosting/process-cap | propia.node `scripts/{recompute-cuotas,compute-medians,resync-stale,sync-display-coords,translate-listings,purge-sessions}.ts` | **No cron script has a lock or in-progress guard.** All six exit cleanly (`process.exit` on both paths, so no zombie), but nothing stops a second run starting while the first is still going. Five are DB-only and bounded by the pool's 8 s connect timeout; **`translate-listings.ts` is not**: it calls the Anthropic SDK sequentially (default 10-minute per-call timeout, 2 retries) over pages of 500 rows with no limit unless `--limit` is passed, so one run can take hours. | On a fixed schedule an hours-long run overlaps the next one: each overlap is another `tsx` Node process with its own 6-connection pool. This is the 189/200 shape from cron instead of requests. Per PLAN.md:472 no cron is scheduled yet, so today this is latent. | Schedule every job through `flock -n <lockfile> …` in the hPanel command (§6.5), and always pass `--limit` to `cron:translate`. Code-level `GET_LOCK` guard is a propia.node backlog item. |
+| F27 | low | hosting/process-cap | propia.node `README.md:77-79` vs `package.json` scripts, `PLAN.md:472` | Deploy docs tell the operator to schedule "counts hourly, sitemap nightly", but no such scripts exist; the six real `cron:*` jobs are elsewhere in the README. PLAN.md still lists the cron setup as an open `[ ]` item. | An operator following the README schedules the wrong things or nothing; the repo cannot tell you what runs. | Rewrite README step 4 to the real job list with intervals and the `flock` form; tick or update PLAN.md:472 once hPanel is checked. |
 | F23 | medium | hosting/process-cap | propia.node: 39 routes `export const dynamic = "force-dynamic"`; `app/page.tsx:66-68`; `app/propiedad/[slug]/page.tsx:51,137,222` | Every public page renders per request (host header is a dynamic API), with 9 DB queries per category/detail view per the post-mortem. Only directory lists, medians, financing and sitemap entries sit behind `unstable_cache`. `next/image` is unused (0 imports), so no in-process `sharp` on the request path (`sharp` is only in `src/lib/images.ts`, the upload path). | Slow-ish, DB-bound requests raise concurrency; concurrency above one instance's connection limit is what makes LiteSpeed start a second and third instance. With zero users that concurrency comes from crawlers hitting up to 25 000 sitemap URLs (`src/lib/sitemap-xml.ts:44-46`). | Not this plan's scope beyond the API: O3 must serve `/api/v1/*` with cache headers LiteSpeed honours (`Cache-Control` **and** `X-LiteSpeed-Cache-Control`) and prove a cache hit after deploy (§5.3.2). Whole-site caching is a propia.node backlog item. |
 | F24 | low | hosting/process-cap | propia.node `app/api/health/route.ts`, `app/api/health/db/route.ts:40-60`, `src/lib/rate-limit.ts:22-28`, `src/lib/auth/rate-limit.ts:54-63` | Health probes are sound: `/api/health` touches nothing; `/api/health/db` is `SELECT 1` bounded by the pool's 8 s timeout and answers 503 on failure. No module-level timers; the two in-memory maps are swept each window, so no unbounded memory growth was found. Nothing in the repo registers either route as a LiteSpeed/uptime health check. | If an external monitor polls `/api/health/db` and the pool is saturated, it will see 503s, which some panels treat as "restart the app". That would explain restarts, not extra instances. | Point any uptime monitor at `/api/health`, not `/api/health/db`; keep the db probe for humans. |
 | F25 | low | hosting/process-cap | propia.node `next.config.ts` (`output: "standalone"`) vs `package.json` `start: next start` | The build emits a standalone server, but the start script runs `next start`. Whichever one Hostinger executes, the other is dead weight; if it runs `npm start`, the standalone output is built and never used. | Confusing during incident triage ("which server is this?"), and doubles build output on a plan at 96 % of resources. | Pick one: drop `output: "standalone"`, or set `start` to `node .next/standalone/server.js` and confirm hPanel's start command matches. |
@@ -127,10 +129,78 @@ were reachable from here. What remains is crawler and monitor traffic. Two or th
 `next-server` instances for that is waste against a shared 200-process cap, and each carries
 its own MySQL pool.
 
+### 6.5 Follow-up investigation (2026-09-02, later the same day)
+
+**Fixed now.** F22, the untimed webhook, is fixed on propia.node branch
+`claude/leads-webhook-timeout` (commit message carries the verification). Not merged: merging
+deploys to production and the repo's CLAUDE.md asks for a flag on request-path changes.
+
+**DB pool re-confirmed (item 4).** Exactly one `mysql.createPool` call in the codebase,
+`src/db/index.ts:22`, at module scope, exported once as `db`. No pool is created per request.
+All explicit: `connectionLimit 6`, `queueLimit 24`, `connectTimeout 8000`, plus `maxIdle`,
+`idleTimeout`, `waitForConnections`. Every cron script imports that same module, so each
+cron *process* gets one pool, which is correct for a separate process. The only other
+connection site is `scripts/check-migrations.ts:85`, a single direct connection that is
+closed at line 357. The July fix is complete.
+
+**Cron scripts (items 2 and 3).** What the repo says is scheduled:
+
+- `PLAN.md:472` — `[ ] hPanel cron jobs: cron:cuotas, cron:medians (nightly)` is still open.
+- `README.md:77-79` — "schedule `npx tsx scripts/<job>.ts` (medians nightly, cuota nightly,
+  counts hourly, sitemap nightly)". Two of those four do not exist as scripts (F27).
+- `ARCHITECTURE.md:79` — "hPanel cron → `npx tsx scripts/*.ts`; every job idempotent +
+  checkpointed".
+
+So by the repo's own record, **nothing is scheduled yet**. If hPanel says otherwise, the
+docs are behind. Per script:
+
+| script | network | bounded by | lock guard | overlap risk on a fixed schedule |
+|---|---|---|---|---|
+| `recompute-cuotas.ts` | DB only | pool timeouts | none | low; seconds per run |
+| `compute-medians.ts` | DB only | pool timeouts | none | low |
+| `resync-stale.ts` | DB only | pool timeouts | none | low |
+| `sync-display-coords.ts` | DB only | pool timeouts | none | low |
+| `purge-sessions.ts` | DB only | pool timeouts | none | low |
+| `translate-listings.ts` | Anthropic API, sequential | SDK default 10 min per call, 2 retries; no run limit unless `--limit` | none | **high**: a run over hundreds of rows takes hours |
+
+None of the six checks whether a previous run is still going (F26). All six exit via
+`process.exit` on success and failure, so a finished run never lingers.
+
+**What only you can check, exact steps:**
+
+1. Cron list. hPanel → Websites → realestateinparaguay.com → Advanced → Cron Jobs. Or over
+   SSH: `crontab -l`. Expected today: empty, or only `cron:cuotas` and `cron:medians`.
+   For each entry note the command and the interval.
+2. Overlap guard. Any entry must be of the form
+   `cd ~/domains/<site>/public_html && flock -n /tmp/propia-<job>.lock npm run cron:<job>`
+   and `cron:translate` must carry `-- --limit 25`. If `flock` is missing on the box,
+   report it and the guard moves into the scripts (backlog).
+3. Instance count. hPanel → Websites → the Node.js app for propia.node → application settings.
+   Look for "instances", "max processes" or "max connections"; set instances to **1**.
+4. Live process census over SSH, run twice ten minutes apart:
+   `ps -eo pid,etime,nlwp,rss,cmd | grep -E 'next-server|tsx|node ' | grep -v grep`.
+   `etime` tells whether the extra `next-server` processes are long-lived (panel setting)
+   or minutes old (spawned on demand); `nlwp` is the thread count each one charges to the
+   cap; any `tsx` row older than a few minutes is a cron run still going.
+5. Log check. `~/logs` or hPanel → Analytics/Access log: count requests per minute on
+   `/propiedad/` for one day. Crawler bursts there plus per-request SSR is the only
+   remaining way this app raises concurrency.
+
+**Updated confidence.** With the pool bounded (July) and the webhook bounded (now), and no
+cron scheduled per the repo, propia.node's steady-state cost is instances × roughly 11
+threads. At the 2 to 3 instances you observed that is about 33 of 200, one sixth of the cap.
+I am confident it **cannot fill the cap on its own under that configuration**. Two ways it
+still could, both checkable by the steps above: an uncapped instance setting letting
+LiteSpeed spawn many `next-server` processes under a crawler burst (steps 3 to 5), or an
+overlapping `cron:translate` schedule (steps 1 and 2). If both come back clean, the
+remaining load is the neighbours, which is what the repo's own post-mortem already
+concluded.
+
 Recommended actions, in order (all outside this repo; only the O3 items are in this plan):
 1. In hPanel, set the propia.node Node.js app to **1 instance** and record the setting in
    propia.node PLAN.md. Revisit only when an access log shows real concurrency.
-2. Ship F22 (timeout, or move the CRM push into `after()`): plan O3 §5.3.6.
+2. Merge propia.node branch `claude/leads-webhook-timeout` (F22 fix, commit `07de6c2`).
+   Hostinger deploys it on merge; check `/api/health` afterwards.
 3. Pull one day of the LiteSpeed access log; if `/propiedad/*` crawler bursts dominate, the
    durable fix is response caching for public pages (propia.node backlog), and the mobile API
    must not add to it: O3 serves `/api/v1/*` with `Cache-Control` and
@@ -141,5 +211,9 @@ Recommended actions, in order (all outside this repo; only the O3 items are in t
 ## 5. Fixed in this session
 
 - `9320775` — declare `expo-asset ~11.0.5` as a direct dependency so Metro can start on a fresh clone (F3). Verified with `npm run typecheck` and `npx expo export --platform ios` (bundle produced).
+
+- propia.node `07de6c2` on branch `claude/leads-webhook-timeout` — 12 s `AbortSignal.timeout`
+  on the outbound webhook (F22). Typecheck, build, `verify:local` green; stalled-sink proof
+  passed. Pushed, not merged, no PR.
 
 Not fixed, by design: everything else is in `fable/plan.md`.

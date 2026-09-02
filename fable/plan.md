@@ -293,6 +293,9 @@ closing report (§4.9 STOP footer in the prompt) posted.
 - 2026-09-02 — Process-cap investigation added (REVIEW §6, F19–F25). Outcome for this plan:
   O3 gains LiteSpeed cache headers + hit check (§5.3.2, §5.3.5) and the `/api/leads` webhook
   timeout/`after()` port (§5.3.6). hPanel instance count is a human action, not a phase.
+- 2026-09-02 — F22 fixed directly on propia.node branch `claude/leads-webhook-timeout`
+  (`07de6c2`, unmerged). F26/F27 (cron lock guards, stale cron docs) added; O3 §5.3.6 is now
+  the optional `after()` move only, if the branch is merged first.
 
 ## §10 Backlog
 
